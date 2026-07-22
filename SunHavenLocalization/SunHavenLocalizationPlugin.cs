@@ -10,7 +10,7 @@ using UnityEngine.SceneManagement;
 
 namespace SunHavenLocalization
 {
-    [BepInPlugin("xiaoye97.SunHavenLocalization", "SunHavenLocalization", "1.3.10")]
+    [BepInPlugin("xiaoye97.SunHavenLocalization", "SunHavenLocalization", "1.3.8")]
     public class SunHavenLocalizationPlugin : BaseUnityPlugin
     {
         public static SunHavenLocalizationPlugin Instance;
@@ -24,8 +24,8 @@ namespace SunHavenLocalization
 
         public static LocStorage LoadedLocStorage;
 
-        public static List<string> SuccKeys = new List<string>();
-        public static List<string> FailKeys = new List<string>();
+        public static HashSet<string> SuccKeys = new HashSet<string>();
+        public static HashSet<string> FailKeys = new HashSet<string>();
         private const string PreferredLanguageCode = "zh-CN";
         private static LocStorage _originalTextCacheStorage;
         private static readonly Dictionary<string, Dictionary<string, string>> OriginalTextTranslationCache =
@@ -47,7 +47,7 @@ namespace SunHavenLocalization
             LogGetTranslationFailCall = Config.Bind<bool>("dev", "LogGetTranslationFailCall", false, "Log LocalizationManager.GetTranslation fail call");
             AllowMultipleTimesLogGetTranslationSuccCall = Config.Bind<bool>("dev", "AllowMultipleTimesLogGetTranslationSuccCall", false);
             AllowMultipleTimesLogGetTranslationFailCall = Config.Bind<bool>("dev", "AllowMultipleTimesLogGetTranslationFailCall", false);
-            LogInfo("=== SunHavenLocalization v1.3.10 Loading ===");
+            LogInfo("=== SunHavenLocalization v1.3.8 Loading ===");
             try
             {
                 var harmony = new Harmony("xiaoye97.SunHavenLocalization");
@@ -65,7 +65,7 @@ namespace SunHavenLocalization
             StartCoroutine(DelayedLoadAll("startup", 180));
 
             Credits.ShowCredits();
-            LogInfo("=== SunHavenLocalization v1.3.10 Loaded ===");
+            LogInfo("=== SunHavenLocalization v1.3.8 Loaded ===");
         }
 
         /// <summary>
@@ -195,6 +195,62 @@ namespace SunHavenLocalization
                     readBook,
                     prefix: new HarmonyMethod(typeof(SunHavenLocalizationPlugin), nameof(BookHandler_ReadBook_Prefix)));
                 LogInfo("Patched Wish.BookHandler.ReadBook.");
+            }
+
+            PatchOptionalDialogueMethod(harmony);
+            PatchOptionalBuffMethods(harmony);
+        }
+
+        private static void PatchOptionalDialogueMethod(Harmony harmony)
+        {
+            var dialogueHelperType = AccessTools.TypeByName("Wish.DialogueHelper");
+            var replace = dialogueHelperType == null
+                ? null
+                : AccessTools.Method(dialogueHelperType, "Replace", new[] { typeof(string) });
+
+            if (replace == null)
+            {
+                LogWarning("Wish.DialogueHelper.Replace not found; hardcoded dialogue patch skipped.");
+                return;
+            }
+
+            try
+            {
+                harmony.Patch(
+                    replace,
+                    postfix: new HarmonyMethod(typeof(SunHavenLocalizationPlugin), nameof(DialogueHelper_Replace_Postfix)));
+                LogInfo("Patched Wish.DialogueHelper.Replace.");
+            }
+            catch (Exception ex)
+            {
+                LogError($"Failed to patch Wish.DialogueHelper.Replace: {ex}");
+            }
+        }
+
+        private static void PatchOptionalBuffMethods(Harmony harmony)
+        {
+            string[] buffTypeNames = { "Wish.StatBuff", "Wish.HourlyBuff" };
+            foreach (string buffTypeName in buffTypeNames)
+            {
+                var buffType = AccessTools.TypeByName(buffTypeName);
+                var startBuff = buffType == null ? null : AccessTools.Method(buffType, "StartBuff");
+                if (startBuff == null)
+                {
+                    LogWarning($"{buffTypeName}.StartBuff not found; hardcoded buff text patch skipped.");
+                    continue;
+                }
+
+                try
+                {
+                    harmony.Patch(
+                        startBuff,
+                        prefix: new HarmonyMethod(typeof(SunHavenLocalizationPlugin), nameof(Buff_StartBuff_Prefix)));
+                    LogInfo($"Patched {buffTypeName}.StartBuff.");
+                }
+                catch (Exception ex)
+                {
+                    LogError($"Failed to patch {buffTypeName}.StartBuff: {ex}");
+                }
             }
         }
 
@@ -454,6 +510,12 @@ namespace SunHavenLocalization
             if (ExactHardcodedTextReplacements.TryGetValue(trimmed, out var exactTranslation))
                 return PreserveOuterWhitespace(text, exactTranslation);
 
+            if (ExactHardcodedTextLocalizationKeys.TryGetValue(trimmed, out var localizationKey) &&
+                TryGetLoadedTranslation(localizationKey, out exactTranslation))
+            {
+                return PreserveOuterWhitespace(text, exactTranslation);
+            }
+
             string plaqueOpening = "A grand plaque, inscribed with the names of all those who helped bring Sun Haven to life...";
             if (trimmed.StartsWith(plaqueOpening, StringComparison.Ordinal))
             {
@@ -551,8 +613,10 @@ namespace SunHavenLocalization
 
             string result = text;
 
+            result = FixDonationBoxText(result);
+            result = FixKnownLocalizedFragments(result);
+
             result = FixSkillTreeRequirementText(result);
-            result = FixDynamicBuffDescriptionText(result);
             result = System.Text.RegularExpressions.Regex.Replace(
                 result,
                 @"(\d+)\s*point\(s\) in this skill\)",
@@ -581,88 +645,45 @@ namespace SunHavenLocalization
             return result;
         }
 
-        private static string FixDynamicBuffDescriptionText(string text)
+        private static string FixDonationBoxText(string text)
         {
-            if (string.IsNullOrWhiteSpace(text) ||
-                text.IndexOf(" increases ", StringComparison.OrdinalIgnoreCase) < 0)
+            if (string.IsNullOrEmpty(text) ||
+                (!text.Contains("donate mana orbs") &&
+                 !(text.Contains("Donate ") && text.Contains("mana orb"))))
             {
                 return text;
             }
 
-            var match = System.Text.RegularExpressions.Regex.Match(
-                text.Trim(),
-                @"^(?<name>.+?)\s+increases\s+(?<effects>.+?)(?<period>\.)?$",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-            if (!match.Success)
-                return text;
-
-            string translatedEffects = TranslateBuffEffectList(match.Groups["effects"].Value);
-            if (string.Equals(translatedEffects, match.Groups["effects"].Value, StringComparison.Ordinal))
-                return text;
-
-            string translatedName = TranslateBuffName(match.Groups["name"].Value.Trim());
-            string period = match.Groups["period"].Success ? "。" : string.Empty;
-            return PreserveOuterWhitespace(text, $"{translatedName}会提高{translatedEffects}{period}");
-        }
-
-        private static string TranslateBuffName(string text)
-        {
-            if (string.IsNullOrWhiteSpace(text))
-                return text;
-
-            string trimmed = text.Trim();
-            if (BuffNameReplacements.TryGetValue(trimmed, out var translation))
-                return translation;
-
-            string result = trimmed;
-            foreach (var kv in BuffNameReplacements)
+            string result = text;
+            if (text.Contains("donate mana orbs") &&
+                TryGetLoadedTranslation("Hardcoded.DonationBox.Prompt", out var promptTemplate))
             {
-                result = System.Text.RegularExpressions.Regex.Replace(
+                result = DonationPromptRegex.Replace(
                     result,
-                    $@"\b{System.Text.RegularExpressions.Regex.Escape(kv.Key)}\b",
-                    kv.Value);
+                    match => promptTemplate.Replace("1111", match.Groups[1].Value),
+                    1);
             }
 
-            return ApplyPhraseReplacements(result);
-        }
-
-        private static string TranslateBuffEffectList(string text)
-        {
-            if (string.IsNullOrWhiteSpace(text))
-                return text;
-
-            string result = text.Trim();
-            result = System.Text.RegularExpressions.Regex.Replace(
-                result,
-                @"\b(?<stat>mana regen|health regen|movement speed|jump height|attack speed|attack damage|spell damage|defense|health|mana)\s+by\s+(?<value>[+-]?\d+(?:\.\d+)?%?)\b",
-                m => $"{TranslateBuffStatName(m.Groups["stat"].Value)} {m.Groups["value"].Value}",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-
-            foreach (var kv in BuffStatReplacements)
+            if (result.Contains("Donate ") &&
+                result.Contains("mana orb") &&
+                TryGetLoadedTranslation("Hardcoded.DonationBox.Option", out var optionTemplate))
             {
-                result = System.Text.RegularExpressions.Regex.Replace(
+                result = DonationOptionRegex.Replace(
                     result,
-                    $@"\b{System.Text.RegularExpressions.Regex.Escape(kv.Key)}\b",
-                    kv.Value,
-                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    match => optionTemplate.Replace("1111", match.Groups[1].Value),
+                    1);
             }
 
-            result = System.Text.RegularExpressions.Regex.Replace(result, @"\s*,\s*and\s+", "和");
-            result = System.Text.RegularExpressions.Regex.Replace(result, @"\s*,\s*", "、");
-            result = System.Text.RegularExpressions.Regex.Replace(result, @"\s+and\s+", "和");
-            result = System.Text.RegularExpressions.Regex.Replace(result, @"\s+", " ");
-            return result.Trim();
+            return result;
         }
 
-        private static string TranslateBuffStatName(string text)
+        private static string FixKnownLocalizedFragments(string text)
         {
-            if (string.IsNullOrWhiteSpace(text))
-                return text;
-
-            foreach (var kv in BuffStatReplacements)
+            const string returnToAmanda = "Return to Amanda at the library";
+            if (text.Contains(returnToAmanda) &&
+                TryGetLoadedTranslation("Quest.ReturnToAmanda", out var translation))
             {
-                if (string.Equals(kv.Key, text.Trim(), StringComparison.OrdinalIgnoreCase))
-                    return kv.Value;
+                return text.Replace(returnToAmanda, translation);
             }
 
             return text;
@@ -694,7 +715,6 @@ namespace SunHavenLocalization
 
             string result = text;
             result = result.Replace("\0", "");
-            result = result.Replace("icon_jump_height", "jump_height_icon");
             result = System.Text.RegularExpressions.Regex.Replace(
                 result,
                 @"<sprite=""([^""]+)""\s*index\s*=\s*(\d+)>",
@@ -851,13 +871,7 @@ namespace SunHavenLocalization
 
                 string fixedText = FixKnownHardcodedText(fallbackSource);
                 if (!string.Equals(fallbackSource, fixedText, StringComparison.Ordinal))
-                {
                     __result = fixedText;
-                    return;
-                }
-
-                if (string.IsNullOrWhiteSpace(__result) && !string.IsNullOrWhiteSpace(defaultText))
-                    __result = CleanupLocalizedText(defaultText);
             }
             catch (Exception ex)
             {
@@ -881,6 +895,49 @@ namespace SunHavenLocalization
             catch (Exception ex)
             {
                 LogError($"BookHandler.ReadBook prefix exception: {ex}");
+            }
+        }
+
+        public static void DialogueHelper_Replace_Postfix(ref string __result)
+        {
+            try
+            {
+                if (LoadedLocStorage == null || string.IsNullOrEmpty(__result))
+                    return;
+
+                if (!ShouldApplyChineseLocalization())
+                    return;
+
+                if (!LooksLikeKnownHardcodedText(__result))
+                    return;
+
+                __result = FixKnownHardcodedText(__result);
+            }
+            catch (Exception ex)
+            {
+                LogError($"DialogueHelper.Replace postfix exception: {ex}");
+            }
+        }
+
+        public static void Buff_StartBuff_Prefix(ref string ___buffName, ref string ___buffDescription)
+        {
+            try
+            {
+                if (LoadedLocStorage == null)
+                    return;
+
+                if (!ShouldApplyChineseLocalization())
+                    return;
+
+                if (LooksLikeKnownHardcodedText(___buffName))
+                    ___buffName = FixKnownHardcodedText(___buffName);
+
+                if (LooksLikeKnownHardcodedText(___buffDescription))
+                    ___buffDescription = FixKnownHardcodedText(___buffDescription);
+            }
+            catch (Exception ex)
+            {
+                LogError($"Buff.StartBuff prefix exception: {ex}");
             }
         }
 
@@ -974,45 +1031,25 @@ namespace SunHavenLocalization
             if (string.IsNullOrEmpty(text))
                 return false;
 
-            if (LooksLikeDynamicBuffDescriptionText(text) ||
-                text.Contains("point(s)") ||
+            if (text.Contains("point(s)") ||
                 text.Contains("points spent") ||
                 text.Contains("skill tree") ||
-                text.Contains("movement_speed_icon") ||
-                text.Contains("jump_height_icon") ||
-                text.Contains("icon_jump_height") ||
                 text.Contains("Movement Speed") ||
-                text.Contains("movement speed") ||
                 text.Contains("Jump Height") ||
-                text.Contains("jump height") ||
-                text.Contains("mana regen") ||
-                text.Contains("health regen") ||
-                text.Contains("Well Fed") ||
-                text.Contains("Farming EXP") ||
-                text.Contains("Mining EXP") ||
-                text.Contains("Combat EXP") ||
-                text.Contains("Fishing EXP") ||
-                text.Contains("Exploration EXP") ||
                 text.Contains("Right-Click") ||
                 text.Contains("Right Clicking") ||
                 text.Contains("Someone") ||
                 text.Contains("Use Speed") ||
                 text.Contains("Automatic Feeder") ||
                 text.Contains("Visit the General Store") ||
-                text.Contains("A beautiful painting") ||
-                text.Contains("pictures are worth") ||
-                text.Contains("Your Fishing Net will catch") ||
-                text.Contains("DANGER! Significant seismic") ||
-                text.Contains("This can't be planted here") ||
-                text.Contains("Not enough mana") ||
-                text.Contains("Raimi with the pests") ||
-                text.Contains("dungeon floor 1") ||
-                text.Contains("Increases defense by") ||
-                text.Contains("Aegis") ||
                 text.Contains("Kitty's Animal Store") ||
                 text.Contains("Grand Tree Tavern") ||
                 text.Contains("Northern Barracks") ||
                 text.Contains("A grand plaque") ||
+                text.Contains("donate mana orbs") ||
+                text.Contains("mana orb") ||
+                text.Contains("Return to Amanda at the library") ||
+                text.Contains("Loading Scenes") ||
                 text.Contains("Turn in ") ||
                 text.Contains("quest available from") ||
                 text.Contains(" at "))
@@ -1021,24 +1058,19 @@ namespace SunHavenLocalization
             }
 
             string trimmed = text.Trim();
-            return ExactHardcodedTextReplacements.ContainsKey(trimmed);
+            return ExactHardcodedTextReplacements.ContainsKey(trimmed) ||
+                   ExactHardcodedTextLocalizationKeys.ContainsKey(trimmed);
         }
 
-        private static bool LooksLikeDynamicBuffDescriptionText(string text)
-        {
-            if (string.IsNullOrEmpty(text))
-                return false;
+        private static readonly System.Text.RegularExpressions.Regex DonationPromptRegex =
+            new System.Text.RegularExpressions.Regex(
+                @"Would you like to donate mana orbs\s*<sprite=""orb_icon""\s*index\s*=\s*0>\s*to the town of Nel'Vari\?\s*\((\d+) donated so far\)",
+                System.Text.RegularExpressions.RegexOptions.Compiled);
 
-            string lowerText = text.ToLowerInvariant();
-            return lowerText.Contains(" increases ") &&
-                   (lowerText.Contains("mana regen") ||
-                    lowerText.Contains("health regen") ||
-                    lowerText.Contains("movement speed") ||
-                    lowerText.Contains("jump height") ||
-                    lowerText.Contains("attack speed") ||
-                    lowerText.Contains("attack damage") ||
-                    lowerText.Contains("spell damage"));
-        }
+        private static readonly System.Text.RegularExpressions.Regex DonationOptionRegex =
+            new System.Text.RegularExpressions.Regex(
+                @"Donate\s+(\d+)\s+mana orbs?\s*<sprite=""orb_icon""\s*index\s*=\s*0>",
+                System.Text.RegularExpressions.RegexOptions.Compiled);
 
         private static readonly Dictionary<string, string> HardcodedTextReplacements = new Dictionary<string, string>
         {
@@ -1056,27 +1088,6 @@ namespace SunHavenLocalization
             { "Automatic Feeder", "自动喂食器" },
             // 任务追踪
             { "Visit the General Store", "参观杂货商店" },
-            // 狮鹫互动文本（硬编码，分两段因为中间有图片）
-            { "You bow your head and look at the ground. Though you can not see the griffon, after a few tentative moments you finally feel it gently pluck the berry", "你低下头看着地面。虽然看不到狮鹫，但过了片刻，你终于感到它轻轻地衔走了浆果" },
-            { "from your hand.", "。" },
-            // 武器属性标签
-            { "Damage", "伤害" },
-            { "Attack Speed", "攻击速度" },
-            // 检查/告示/教程文本。多来自场景资源或直接通知，不一定有 I2 key。
-            { "A beautiful painting, though the subject matter is hauntingly strange.", "这是一幅美丽的画，尽管画中的主题诡异得令人不安。" },
-            { "An army Angels is depicted, flying off into the wild yonder. But then, the Angels fall. They fall, they fall, they fallll... And where they fall, Demons rise.", "画中描绘着一支天使军团，飞向遥远的荒野。可是随后，天使坠落了。他们坠落、坠落、不断坠落……而在他们坠落之处，恶魔崛起了。" },
-            { "Huh! This must be what they mean with the whole \"pictures are worth 1,000 words\" thing.", "哈！这大概就是所谓“一图胜千言”的意思吧。" },
-            { "Your Fishing Net will catch\nfish passively. Come back\nlater and check for caught\nfish!", "你的渔网会被动地捕鱼。\n稍后回来检查捕到的鱼！" },
-            { "Hint: Fishing Nets come in\ndifferent sizes!", "提示：渔网有不同尺寸！" },
-            { "Your Fishing Net will catch fish passively. Come back later and check for caught fish!", "你的渔网会被动地捕鱼。稍后回来检查捕到的鱼！" },
-            { "Hint: Fishing Nets come in different sizes!", "提示：渔网有不同尺寸！" },
-            { "DANGER! Significant seismic activity has been recorded in this mine cave. Turn back now if you value your safety.", "危险！此矿洞内已检测到显著地震活动。若珍惜自身安全，请立即折返。" },
-            { "And whatever you do, DO NOT attempt to mine any crystals...", "无论你做什么，都绝不要尝试开采任何水晶……" },
-            { "This can't be planted here", "这里不能种植" },
-            { "Not enough mana", "法力不足" },
-            { "You must complete dungeon floor 1 to unlock this chest.", "你必须完成地下城第 1 层才能解锁这个宝箱。" },
-            { "Increases defense by 10 and regenerates 0.3 health per second", "防御提高 10，并每秒恢复 0.3 点生命值" },
-            { "Increases defense by 15 and regenerates 1 health per second", "防御提高 15，并每秒恢复 1 点生命值" },
             // 资产文本/名字兜底。
             { "Kitty's Animal Store", "凯蒂的动物商店" },
         };
@@ -1086,42 +1097,32 @@ namespace SunHavenLocalization
             // 交互提示。只做完整文本匹配，避免误改对白里的普通动词。
             { "Take", "拿取" },
             { "Place", "放置" },
-            { "Pickup Fish", "拾取鱼" },
             // 地图任务弹窗标题。
             { "Complete Quest", "完成任务" },
             { "Available Quest", "可接任务" },
             { "Quest Turn In", "任务交付" },
-            // buff popup 文本。StatBuff/HourlyBuff 常把文本直接写进 Popup 默认文本，key 为空。
-            { "Aegis", "圣盾术" },
-            { "Increases defense by 10 and regenerates 0.3 health per second", "防御提高 10，并每秒恢复 0.3 点生命值" },
-            { "Increases defense by 15 and regenerates 1 health per second", "防御提高 15，并每秒恢复 1 点生命值" },
-            // 已有 xyloc 翻译但显示路径直塞原文/混合文本。
-            { "你...HNNNG...帮雷米处理害虫吧 Just help out Raimi with the pests.我...HNNNG...把所有东西都搬进去，越快越好 Get everything moved into place, quick as quick can be.", "你……哼嗯……去帮雷米对付害虫就好。我……哼嗯……会把所有东西搬到位的，越快越好。" },
             // 头顶名牌/对话框标题可能直接设置对象名，不一定走 I2 key。
             { "Arturo", "阿图罗" },
             { "Frankie", "弗兰基" },
             { "Stephen", "斯蒂芬" },
         };
 
-        private static readonly Dictionary<string, string> BuffNameReplacements = new Dictionary<string, string>
+        private static readonly Dictionary<string, string> ExactHardcodedTextLocalizationKeys = new Dictionary<string, string>
         {
-            { "Well Fed", "饱腹" },
-            { "Aftertaste", "余味" },
-            { "Aegis", "圣盾术" },
-        };
-
-        private static readonly List<KeyValuePair<string, string>> BuffStatReplacements = new List<KeyValuePair<string, string>>
-        {
-            new KeyValuePair<string, string>("mana regen", "法力恢复"),
-            new KeyValuePair<string, string>("health regen", "生命恢复"),
-            new KeyValuePair<string, string>("movement speed", "移动速度"),
-            new KeyValuePair<string, string>("jump height", "跳跃高度"),
-            new KeyValuePair<string, string>("attack speed", "攻击速度"),
-            new KeyValuePair<string, string>("attack damage", "攻击力"),
-            new KeyValuePair<string, string>("spell damage", "法术伤害"),
-            new KeyValuePair<string, string>("defense", "防御"),
-            new KeyValuePair<string, string>("health", "生命值"),
-            new KeyValuePair<string, string>("mana", "法力值"),
+            // 游戏逻辑直接写入 DialogueNode / Popup / TMP，不经过 I2。
+            { "Oh finally! I've been looking for Faeyon, but I couldn't hear her anywhere! Well here's the back scratcher she needed. Thanks for delivering it!", "Quest.YouScratchMyBack.DialogueOverride" },
+            { "Thanks.", "Thanks" },
+            { "See ya!", "SeeYaExcited" },
+            { "I'm in need of a new makeover, but then again, so does this salon.", "Hardcoded.RepairSign.BarberSalon" },
+            { "Donate", "Hardcoded.DonationBox.Interaction" },
+            { "Increases Win Area and Sweet Spot during fishing minigame by 99% for 1 hour.", "LegendaryFishBait.Buff.Description" },
+            { "How do I do that?", "HowDoIDoThat" },
+            { "Return to Amanda at the library", "Quest.ReturnToAmanda" },
+            { "You can't upgrade a house with animals inside!", "Hardcoded.PlayerHouse.AnimalsInside" },
+            { "Don't mention it.", "DontMentionItPeriod" },
+            { "Loading Scenes", "Hardcoded.LoadingScenes" },
+            { "Loading World", "LoadingWorld" },
+            { "Loading World from Host", "LoadingWorldFromHost" },
         };
 
         private static readonly List<KeyValuePair<string, string>> PhraseTextReplacements = new List<KeyValuePair<string, string>>
@@ -1135,11 +1136,6 @@ namespace SunHavenLocalization
             new KeyValuePair<string, string>("Kitty's Animal Store", "凯蒂的动物商店"),
             new KeyValuePair<string, string>("Movement Speed", "移动速度"),
             new KeyValuePair<string, string>("Jump Height", "跳跃高度"),
-            new KeyValuePair<string, string>("Farming EXP", "农耕经验"),
-            new KeyValuePair<string, string>("Mining EXP", "采矿经验"),
-            new KeyValuePair<string, string>("Combat EXP", "战斗经验"),
-            new KeyValuePair<string, string>("Fishing EXP", "钓鱼经验"),
-            new KeyValuePair<string, string>("Exploration EXP", "探索经验"),
             // 技能树把 KEYBIND 硬编码替换成 Right-Clicking，需要保持中文句式为“按下右键”。
             new KeyValuePair<string, string>("Right-Clicking", "右键"),
             new KeyValuePair<string, string>("Right Clicking", "右键"),
